@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 import typing
 
 from .._models import Request, Response
@@ -52,12 +53,75 @@ def create_event() -> Event:
     return asyncio.Event()
 
 
+class _AwaitableRunner:
+    def __init__(self, awaitable: typing.Awaitable[typing.Any]):
+        self._generator = awaitable.__await__()
+        self._started = False
+        self._next_item: typing.Any = None
+        self._finished = False
+
+    @types.coroutine
+    def __call__(
+        self, *, until: typing.Optional[typing.Callable[[], bool]] = None
+    ) -> typing.Generator[typing.Any, typing.Any, typing.Any]:
+        while not self._finished and (until is None or not until()):
+            send_value, throw_value = None, None
+            if self._started:
+                try:
+                    send_value = yield self._next_item
+                except BaseException as e:
+                    throw_value = e
+
+            self._started = True
+            try:
+                if throw_value is not None:
+                    self._next_item = self._generator.throw(throw_value)
+                else:
+                    self._next_item = self._generator.send(send_value)
+            except StopIteration as e:
+                self._finished = True
+                return e.value
+            except BaseException:
+                self._generator.close()
+                self._finished = True
+                raise
+
+
 class ASGIResponseStream(AsyncByteStream):
-    def __init__(self, body: list[bytes]) -> None:
+    def __init__(
+        self,
+        body: list[bytes],
+        raise_app_exceptions: bool,
+        response_complete: "Event",
+        app_runner: _AwaitableRunner,
+    ) -> None:
         self._body = body
+        self._raise_app_exceptions = raise_app_exceptions
+        self._response_complete = response_complete
+        self._app_runner = app_runner
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        yield b"".join(self._body)
+        try:
+            while bool(self._body) or not self._response_complete.is_set():
+                if self._body:
+                    yield b"".join(self._body)
+                    self._body.clear()
+                await self._app_runner(
+                    until=lambda: bool(self._body) or self._response_complete.is_set()
+                )
+        except Exception:  # noqa: PIE786
+            if self._raise_app_exceptions:
+                raise
+        finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        self._response_complete.set()
+        try:
+            await self._app_runner()
+        except Exception:  # noqa: PIE786
+            if self._raise_app_exceptions:
+                raise
 
 
 class ASGITransport(AsyncBaseTransport):
@@ -155,8 +219,10 @@ class ASGITransport(AsyncBaseTransport):
                 response_headers = message.get("headers", [])
                 response_started = True
 
-            elif message["type"] == "http.response.body":
-                assert not response_complete.is_set()
+            elif (
+                message["type"] == "http.response.body"
+                and not response_complete.is_set()
+            ):
                 body = message.get("body", b"")
                 more_body = message.get("more_body", False)
 
@@ -166,9 +232,11 @@ class ASGITransport(AsyncBaseTransport):
                 if not more_body:
                     response_complete.set()
 
+        app_runner = _AwaitableRunner(self.app(scope, receive, send))
+
         try:
-            await self.app(scope, receive, send)
-        except Exception:  # noqa: PIE-786
+            await app_runner(until=lambda: response_started)
+        except Exception:  # noqa: PIE786
             if self.raise_app_exceptions:
                 raise
 
@@ -178,10 +246,11 @@ class ASGITransport(AsyncBaseTransport):
             if response_headers is None:
                 response_headers = {}
 
-        assert response_complete.is_set()
         assert status_code is not None
         assert response_headers is not None
 
-        stream = ASGIResponseStream(body_parts)
+        stream = ASGIResponseStream(
+            body_parts, self.raise_app_exceptions, response_complete, app_runner
+        )
 
         return Response(status_code, headers=response_headers, stream=stream)
